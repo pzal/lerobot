@@ -56,6 +56,20 @@ class SmolVLAConfig(PreTrainedConfig):
     # Gripper dimensions will remain in absolute values.
     use_delta_joint_actions_aloha: bool = False
 
+    # Relative actions: converts absolute actions to relative (relative to state).
+    use_relative_actions: bool = False
+    # Feature names to exclude from relative conversion (kept absolute). Empty list = all dims relative.
+    relative_exclude_features: list[str] = field(default_factory=lambda: ["tool"])
+    # Populated at runtime from dataset metadata by make_policy.
+    action_feature_names: list[str] | None = None
+
+    # State masking: list of state feature names to zero out before the model sees them.
+    # Names must match the dataset feature names for observation.state.
+    # Empty list = no masking (all state visible). Masking is applied AFTER normalization.
+    state_mask: list[str] = field(default_factory=list)
+    # Populated at runtime from dataset metadata by make_policy.
+    state_feature_names: list[str] | None = None
+
     # Tokenizer
     tokenizer_max_length: int = 48
 
@@ -147,8 +161,8 @@ class SmolVLAConfig(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> list:
-        return [0]
+    def observation_delta_indices(self) -> None:
+        return None
 
     @property
     def action_delta_indices(self) -> list:

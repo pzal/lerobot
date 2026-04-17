@@ -39,6 +39,7 @@ from lerobot.processor import (
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import (
     ACTION,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -513,6 +514,12 @@ def make_policy(
         action_names = ds_meta.features.get(ACTION, {}).get("names")
         if action_names is not None:
             cfg.action_feature_names = list(action_names)
+
+    # Store state feature names for state masking support
+    if ds_meta is not None and hasattr(cfg, "state_feature_names"):
+        state_names = ds_meta.features.get(OBS_STATE, {}).get("names")
+        if state_names is not None:
+            cfg.state_feature_names = list(state_names)
 
     kwargs["config"] = cfg
 
