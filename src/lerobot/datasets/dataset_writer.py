@@ -22,6 +22,7 @@ import contextlib
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import datasets
@@ -217,8 +218,18 @@ class DatasetWriter:
         self,
         episode_data: dict | None = None,
         parallel_encoding: bool = True,
-    ) -> None:
-        """Save the current episode in self.episode_buffer to disk."""
+    ) -> dict[str, float]:
+        """Save the current episode in self.episode_buffer to disk.
+
+        Returns a dict of ``{step_name: seconds}`` timings for the main steps,
+        with per-camera entries reported as ``save_video.<video_key>``. Optional
+        steps (streaming finish, parallel/batch encoding, clear_buffer) only
+        appear when they actually run.
+        """
+        timings: dict[str, float] = {}
+        t_total = time.perf_counter()
+
+        t0 = time.perf_counter()
         episode_buffer = episode_data if episode_data is not None else self.episode_buffer
 
         validate_episode_buffer(episode_buffer, self._meta.total_episodes, self._meta.features)
@@ -242,14 +253,18 @@ class DatasetWriter:
             if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
+        timings["validate_and_prepare"] = time.perf_counter() - t0
 
         # Wait for image writer to end, so that episode stats over images can be computed
+        t0 = time.perf_counter()
         self._wait_image_writer()
+        timings["wait_image_writer"] = time.perf_counter() - t0
 
         has_video_keys = len(self._meta.video_keys) > 0
         use_streaming = self._streaming_encoder is not None and has_video_keys
         use_batched_encoding = self._batch_encoding_size > 1
 
+        t0 = time.perf_counter()
         if use_streaming:
             non_video_buffer = {
                 k: v
@@ -260,11 +275,17 @@ class DatasetWriter:
             ep_stats = compute_episode_stats(non_video_buffer, non_video_features)
         else:
             ep_stats = compute_episode_stats(episode_buffer, self._meta.features)
+        timings["compute_stats"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         ep_metadata = self._save_episode_data(episode_buffer)
+        timings["save_episode_data"] = time.perf_counter() - t0
 
         if use_streaming:
+            t0 = time.perf_counter()
             streaming_results = self._streaming_encoder.finish_episode()
+            timings["streaming_finish_episode"] = time.perf_counter() - t0
+
             for video_key in self._meta.video_keys:
                 temp_path, video_stats = streaming_results[video_key]
                 if video_stats is not None:
@@ -272,10 +293,13 @@ class DatasetWriter:
                         k: v if k == "count" else np.squeeze(v.reshape(1, -1, 1, 1) / 255.0, axis=0)
                         for k, v in video_stats.items()
                     }
+                t0 = time.perf_counter()
                 ep_metadata.update(self._save_episode_video(video_key, episode_index, temp_path=temp_path))
+                timings[f"save_video.{video_key}"] = time.perf_counter() - t0
         elif has_video_keys and not use_batched_encoding:
             num_cameras = len(self._meta.video_keys)
             if parallel_encoding and num_cameras > 1:
+                t0 = time.perf_counter()
                 with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
                     future_to_key = {
                         executor.submit(
@@ -299,29 +323,43 @@ class DatasetWriter:
                         except Exception as exc:
                             logger.error(f"Video encoding failed for {video_key}: {exc}")
                             raise exc
+                timings["parallel_encode_videos"] = time.perf_counter() - t0
 
                 for video_key in self._meta.video_keys:
                     temp_path = results[video_key]
+                    t0 = time.perf_counter()
                     ep_metadata.update(
                         self._save_episode_video(video_key, episode_index, temp_path=temp_path)
                     )
+                    timings[f"save_video.{video_key}"] = time.perf_counter() - t0
             else:
                 for video_key in self._meta.video_keys:
+                    t0 = time.perf_counter()
                     ep_metadata.update(self._save_episode_video(video_key, episode_index))
+                    timings[f"save_video.{video_key}"] = time.perf_counter() - t0
 
         # `meta.save_episode` need to be executed after encoding the videos
+        t0 = time.perf_counter()
         self._meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
+        timings["meta_save_episode"] = time.perf_counter() - t0
 
         if has_video_keys and use_batched_encoding:
             self._episodes_since_last_encoding += 1
             if self._episodes_since_last_encoding == self._batch_encoding_size:
                 start_ep = self._meta.total_episodes - self._batch_encoding_size
                 end_ep = self._meta.total_episodes
+                t0 = time.perf_counter()
                 self._batch_save_episode_video(start_ep, end_ep)
+                timings["batch_encode_videos"] = time.perf_counter() - t0
                 self._episodes_since_last_encoding = 0
 
         if episode_data is None:
+            t0 = time.perf_counter()
             self.clear_episode_buffer(delete_images=len(self._meta.image_keys) > 0)
+            timings["clear_buffer"] = time.perf_counter() - t0
+
+        timings["total"] = time.perf_counter() - t_total
+        return timings
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """Batch save videos for multiple episodes."""
