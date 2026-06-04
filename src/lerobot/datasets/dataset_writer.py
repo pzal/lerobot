@@ -294,7 +294,15 @@ class DatasetWriter:
                         for k, v in video_stats.items()
                     }
                 t0 = time.perf_counter()
-                ep_metadata.update(self._save_episode_video(video_key, episode_index, temp_path=temp_path))
+                ep_metadata.update(
+                    self._save_episode_video(
+                        video_key,
+                        episode_index,
+                        temp_path=temp_path,
+                        timings=timings,
+                        timing_prefix=f"save_video.{video_key}",
+                    )
+                )
                 timings[f"save_video.{video_key}"] = time.perf_counter() - t0
         elif has_video_keys and not use_batched_encoding:
             num_cameras = len(self._meta.video_keys)
@@ -329,13 +337,26 @@ class DatasetWriter:
                     temp_path = results[video_key]
                     t0 = time.perf_counter()
                     ep_metadata.update(
-                        self._save_episode_video(video_key, episode_index, temp_path=temp_path)
+                        self._save_episode_video(
+                            video_key,
+                            episode_index,
+                            temp_path=temp_path,
+                            timings=timings,
+                            timing_prefix=f"save_video.{video_key}",
+                        )
                     )
                     timings[f"save_video.{video_key}"] = time.perf_counter() - t0
             else:
                 for video_key in self._meta.video_keys:
                     t0 = time.perf_counter()
-                    ep_metadata.update(self._save_episode_video(video_key, episode_index))
+                    ep_metadata.update(
+                        self._save_episode_video(
+                            video_key,
+                            episode_index,
+                            timings=timings,
+                            timing_prefix=f"save_video.{video_key}",
+                        )
+                    )
                     timings[f"save_video.{video_key}"] = time.perf_counter() - t0
 
         # `meta.save_episode` need to be executed after encoding the videos
@@ -476,14 +497,24 @@ class DatasetWriter:
         video_key: str,
         episode_index: int,
         temp_path: Path | None = None,
+        timings: dict[str, float] | None = None,
+        timing_prefix: str = "",
     ) -> dict:
+        def _record(name: str, t0: float) -> None:
+            if timings is not None:
+                timings[f"{timing_prefix}.{name}"] = time.perf_counter() - t0
+
         if temp_path is None:
+            t0 = time.perf_counter()
             ep_path = self._encode_temporary_episode_video(video_key, episode_index)
+            _record("encode_temp", t0)
         else:
             ep_path = temp_path
 
+        t0 = time.perf_counter()
         ep_size_in_mb = get_file_size_in_mb(ep_path)
         ep_duration_in_s = get_video_duration_in_s(ep_path)
+        _record("probe_ep", t0)
 
         if (
             episode_index == 0
@@ -502,7 +533,9 @@ class DatasetWriter:
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
             new_path.parent.mkdir(parents=True, exist_ok=True)
+            t0 = time.perf_counter()
             shutil.move(str(ep_path), str(new_path))
+            _record("move", t0)
         else:
             latest_ep = self._meta.latest_episode
             chunk_idx = latest_ep[f"videos/{video_key}/chunk_index"][0]
@@ -511,7 +544,9 @@ class DatasetWriter:
             latest_path = self._root / self._meta.video_path.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
+            t0 = time.perf_counter()
             latest_size_in_mb = get_file_size_in_mb(latest_path)
+            _record("probe_latest", t0)
             latest_duration_in_s = latest_ep[f"videos/{video_key}/to_timestamp"][0]
 
             if latest_size_in_mb + ep_size_in_mb >= self._meta.video_files_size_in_mb:
@@ -520,21 +555,31 @@ class DatasetWriter:
                     video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
                 )
                 new_path.parent.mkdir(parents=True, exist_ok=True)
+                t0 = time.perf_counter()
                 shutil.move(str(ep_path), str(new_path))
+                _record("move", t0)
                 latest_duration_in_s = 0.0
             else:
+                t0 = time.perf_counter()
                 concatenate_video_files(
                     [latest_path, ep_path],
                     latest_path,
+                    timings=timings,
+                    timing_prefix=f"{timing_prefix}.concat" if timings is not None else "",
                 )
+                _record("concat", t0)
 
         # Remove temporary directory
+        t0 = time.perf_counter()
         shutil.rmtree(str(ep_path.parent))
+        _record("rmtree_temp", t0)
 
         # Update video info (only needed when first episode is encoded)
         if episode_index == 0:
+            t0 = time.perf_counter()
             self._meta.update_video_info(video_key)
             write_info(self._meta.info, self._meta.root)
+            _record("update_info", t0)
 
         metadata = {
             "episode_index": episode_index,

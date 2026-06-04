@@ -21,6 +21,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 import warnings
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -487,7 +488,11 @@ def encode_video_frames(
 
 
 def concatenate_video_files(
-    input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
+    input_video_paths: list[Path | str],
+    output_video_path: Path,
+    overwrite: bool = True,
+    timings: dict[str, float] | None = None,
+    timing_prefix: str = "",
 ):
     """
     Concatenate multiple video files into a single video file using pyav.
@@ -500,6 +505,10 @@ def concatenate_video_files(
         input_video_paths: Ordered list of input video file paths to concatenate.
         output_video_path: Path to the output video file.
         overwrite: Whether to overwrite the output video file if it already exists. Default is True.
+        timings: Optional dict to populate with per-sub-step durations in seconds. Keys are
+            written as ``f"{timing_prefix}.<step>"`` for ``setup``, ``open_input``,
+            ``open_output``, ``demux_remux``, ``close_output``, ``finalize``.
+        timing_prefix: Prefix used when ``timings`` is supplied.
 
     Note:
         - Creates a temporary directory for intermediate files that is cleaned up after use.
@@ -507,12 +516,17 @@ def concatenate_video_files(
           codec, resolution, and frame rate for proper concatenation.
     """
 
+    def _record(name: str, t0: float) -> None:
+        if timings is not None:
+            timings[f"{timing_prefix}.{name}"] = time.perf_counter() - t0
+
     output_video_path = Path(output_video_path)
 
     if output_video_path.exists() and not overwrite:
         logger.warning(f"Video file already exists: {output_video_path}. Skipping concatenation.")
         return
 
+    t0 = time.perf_counter()
     output_video_path.parent.mkdir(parents=True, exist_ok=True)
 
     if len(input_video_paths) == 0:
@@ -525,12 +539,16 @@ def concatenate_video_files(
             tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
         tmp_concatenate_file.flush()
         tmp_concatenate_path = tmp_concatenate_file.name
+    _record("setup", t0)
 
     # Create input and output containers
+    t0 = time.perf_counter()
     input_container = av.open(
         tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
     )  # safe = 0 allows absolute paths as well as relative paths
+    _record("open_input", t0)
 
+    t0 = time.perf_counter()
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
@@ -548,8 +566,10 @@ def concatenate_video_files(
 
             # set the time base to the input stream time base (missing in the codec context)
             stream_map[input_stream.index].time_base = input_stream.time_base
+    _record("open_output", t0)
 
     # Demux + remux packets (no re-encode)
+    t0 = time.perf_counter()
     for packet in input_container.demux():
         # Skip packets from un-mapped streams
         if packet.stream.index not in stream_map:
@@ -562,11 +582,17 @@ def concatenate_video_files(
         output_stream = stream_map[packet.stream.index]
         packet.stream = output_stream
         output_container.mux(packet)
+    _record("demux_remux", t0)
 
+    t0 = time.perf_counter()
     input_container.close()
     output_container.close()
+    _record("close_output", t0)
+
+    t0 = time.perf_counter()
     shutil.move(tmp_output_video_path, output_video_path)
     Path(tmp_concatenate_path).unlink()
+    _record("finalize", t0)
 
 
 class _CameraEncoderThread(threading.Thread):
